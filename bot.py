@@ -7,10 +7,10 @@ import telegram
 from dotenv import load_dotenv
 import os
 import logging
+import asyncio
 from strategies import TradingStrategy
 from utils import generate_signature, get_timestamp
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,9 +27,13 @@ class IndodaxTradingBot:
 
         # Initialize exchange
         self.exchange = ccxt.indodax({
-            'apiKey': os.getenv('L5YVCKEC-IZ8GENQV-RCAP5QRD-55ZJQ06T-J0NKVMQS'),
-            'secret': os.getenv('d3e1b62413fbf702dabebebdef133689061b4b8e85273ecdc4f08c872f2fa6f92f1f72737c9a9f41'),
-            'enableRateLimit': True
+            'apiKey': os.getenv('INDODAX_API_KEY'),  # Changed to use environment variable
+            'secret': os.getenv('INDODAX_SECRET'),   # Changed to use environment variable
+            'enableRateLimit': True,
+            'timeout': 30000,
+            'options': {
+                'adjustForTimeDifference': True
+            }
         })
 
         # Initialize Telegram
@@ -70,20 +74,36 @@ class IndodaxTradingBot:
     def get_market_data(self):
         """Get historical market data"""
         try:
+            # Add delay for rate limiting
+            time.sleep(self.exchange.rateLimit / 1000)
+            
+            # Ensure exchange markets are loaded
+            self.exchange.load_markets()
+            
             ohlcv = self.exchange.fetch_ohlcv(
                 symbol=self.symbol,
                 timeframe=self.timeframe,
                 limit=100
             )
+            
+            if not ohlcv:
+                logging.error("Empty OHLCV data received")
+                return None
+                
             df = pd.DataFrame(
                 ohlcv,
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
+            
+        except ccxt.NetworkError as e:
+            logging.error(f"Network error fetching market data: {e}")
+        except ccxt.ExchangeError as e:
+            logging.error(f"Exchange error: {e}")
         except Exception as e:
-            logging.error(f"Error fetching market data: {e}")
-            return None
+            logging.error(f"Unexpected error: {e}")
+        return None
 
     def execute_trade(self, action, price):
         """Execute buy/sell orders"""
@@ -138,22 +158,32 @@ class IndodaxTradingBot:
 
         while True:
             try:
+                await asyncio.sleep(self.exchange.rateLimit / 1000)
+                
                 # Reset daily trades
                 current_date = datetime.now().date()
                 if self.last_trade_date != current_date:
                     self.daily_trades = 0
                     self.last_trade_date = current_date
 
-                # Get market data
-                df = self.get_market_data()
+                # Get market data with retries
+                retries = 3
+                df = None
+                for _ in range(retries):
+                    df = self.get_market_data()
+                    if df is not None:
+                        break
+                    await asyncio.sleep(5)
+
                 if df is None:
-                    time.sleep(60)
+                    logging.error("Failed to fetch market data after retries")
+                    await asyncio.sleep(60)
                     continue
 
                 # Calculate indicators
                 df = self.strategy.calculate_indicators(df)
                 if df is None:
-                    time.sleep(60)
+                    await asyncio.sleep(60)
                     continue
 
                 current_price = df['close'].iloc[-1]
@@ -163,7 +193,7 @@ class IndodaxTradingBot:
                     await self.send_notification(
                         f"Position closed at {current_price}"
                     )
-                    time.sleep(60)
+                    await asyncio.sleep(60)
                     continue
 
                 # Get trading signals
@@ -187,14 +217,13 @@ class IndodaxTradingBot:
                             f"EMA Status: {signals['ema_status']}"
                         )
 
-                time.sleep(60)  # Wait for 1 minute
+                await asyncio.sleep(60)  # Wait for 1 minute
 
             except Exception as e:
                 logging.error(f"Error in main loop: {e}")
                 await self.send_notification(f"Error occurred: {e}")
-                time.sleep(60)
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
     bot = IndodaxTradingBot()
-    import asyncio
     asyncio.run(bot.run())
